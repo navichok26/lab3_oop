@@ -105,9 +105,15 @@ long remote_call(pid_t pid, void *func_addr, long *args, int arg_count, int rest
         exit(EXIT_FAILURE);
     }
 
+    // Сохраняем оригинальный код по адресу функции
+    unsigned long original_data = ptrace(PTRACE_PEEKTEXT, pid, regs.ARCH_IP, NULL);
+    if (original_data == -1 && errno) {
+        perror("ptrace(PEEKTEXT) - чтение оригинального кода");
+        exit(EXIT_FAILURE);
+    }
+
     // Вставляем инструкцию int 3 (breakpoint) для остановки после выполнения
-    unsigned long data = ptrace(PTRACE_PEEKTEXT, pid, regs.ARCH_IP, NULL);
-    unsigned long int3 = (data & ~0xFF) | 0xCC;
+    unsigned long int3 = (original_data & ~0xFF) | 0xCC;
     if (ptrace(PTRACE_POKETEXT, pid, regs.ARCH_IP, int3) == -1) {
         perror("ptrace(POKETEXT) - int3");
         exit(EXIT_FAILURE);
@@ -116,15 +122,23 @@ long remote_call(pid_t pid, void *func_addr, long *args, int arg_count, int rest
     // Продолжаем выполнение до достижения точки останова
     if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
         perror("ptrace(CONT)");
+        // Восстанавливаем оригинальный код
+        ptrace(PTRACE_POKETEXT, pid, regs.ARCH_IP, original_data);
         exit(EXIT_FAILURE);
     }
     
     int status;
     waitpid(pid, &status, 0);
 
+    // Восстанавливаем оригинальный код
+    if (ptrace(PTRACE_POKETEXT, pid, regs.ARCH_IP, original_data) == -1) {
+        perror("ptrace(POKETEXT) - восстановление");
+        exit(EXIT_FAILURE);
+    }
+
     // Проверяем, что процесс остановился по breakpoint
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        fprintf(stderr, "Процесс не остановился по SIGTRAP\n");
+        fprintf(stderr, "Процесс не остановился по SIGTRAP (сигнал: %d)\n", WSTOPSIG(status));
         exit(EXIT_FAILURE);
     }
 
@@ -146,6 +160,64 @@ long remote_call(pid_t pid, void *func_addr, long *args, int arg_count, int rest
     }
 
     return ret;
+}
+
+// Добавьте эту функцию для нахождения адресов в адресном пространстве целевого процесса
+void *find_remote_symbol(pid_t pid, const char *lib_name, const char *symbol_name) {
+    char maps_path[64];
+    char line[1024];
+    unsigned long lib_addr = 0;
+    FILE *maps;
+
+    sprintf(maps_path, "/proc/%d/maps", pid);
+    maps = fopen(maps_path, "r");
+    if (!maps) {
+        perror("Ошибка при открытии карты памяти процесса");
+        return NULL;
+    }
+
+    // Ищем базовый адрес библиотеки
+    while (fgets(line, sizeof(line), maps)) {
+        if (strstr(line, lib_name)) {
+            sscanf(line, "%lx-", &lib_addr);
+            break;
+        }
+    }
+    fclose(maps);
+
+    if (!lib_addr) {
+        fprintf(stderr, "Не удалось найти библиотеку %s в процессе %d\n", lib_name, pid);
+        return NULL;
+    }
+
+    // Находим смещение символа в нашем процессе
+    void *handle = dlopen(lib_name, RTLD_LAZY);
+    if (!handle) {
+        fprintf(stderr, "Не удалось загрузить библиотеку %s: %s\n", lib_name, dlerror());
+        return NULL;
+    }
+
+    void *symbol = dlsym(handle, symbol_name);
+    if (!symbol) {
+        fprintf(stderr, "Символ %s не найден в библиотеке %s: %s\n", symbol_name, lib_name, dlerror());
+        dlclose(handle);
+        return NULL;
+    }
+
+    // Получаем базовый адрес библиотеки в нашем процессе
+    Dl_info info;
+    if (!dladdr(symbol, &info)) {
+        fprintf(stderr, "Не удалось получить информацию о символе %s\n", symbol_name);
+        dlclose(handle);
+        return NULL;
+    }
+
+    // Вычисляем смещение внутри библиотеки
+    unsigned long offset = (unsigned long)symbol - (unsigned long)info.dli_fbase;
+    dlclose(handle);
+
+    // Возвращаем адрес символа в удаленном процессе
+    return (void*)(lib_addr + offset);
 }
 
 int main(int argc, char *argv[]) {
@@ -187,22 +259,24 @@ int main(int argc, char *argv[]) {
 
     printf("Процесс остановлен, начинаем инъекцию\n");
 
-    // Получаем адрес функции dlopen в целевом процессе
-    void *dlopen_addr = (void *)dlsym(RTLD_NEXT, "dlopen");
-    if (dlopen_addr == NULL) {
-        fprintf(stderr, "Не удалось найти dlopen: %s\n", dlerror());
+    // Получаем адреса функций в целевом процессе
+    void *dlopen_addr = find_remote_symbol(pid, "libdl.so.2", "dlopen");
+    if (!dlopen_addr) {
+        dlopen_addr = find_remote_symbol(pid, "libc.so.6", "dlopen");
+    }
+
+    if (!dlopen_addr) {
+        fprintf(stderr, "Не удалось найти dlopen в целевом процессе\n");
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return EXIT_FAILURE;
     }
 
     printf("Адрес dlopen: %p\n", dlopen_addr);
 
-    // Выделяем память в удаленном процессе для пути к библиотеке
-    void *remote_dlopen_addr = dlopen_addr;
-    void *remote_malloc_addr = (void *)dlsym(RTLD_NEXT, "malloc");
-    
-    if (remote_malloc_addr == NULL) {
-        fprintf(stderr, "Не удалось найти malloc: %s\n", dlerror());
+    // Находим malloc в целевом процессе
+    void *malloc_addr = find_remote_symbol(pid, "libc.so.6", "malloc");
+    if (!malloc_addr) {
+        fprintf(stderr, "Не удалось найти malloc в целевом процессе\n");
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return EXIT_FAILURE;
     }
@@ -210,7 +284,7 @@ int main(int argc, char *argv[]) {
     // Вызываем malloc в удаленном процессе
     long malloc_args[1];
     malloc_args[0] = strlen(abs_lib_path) + 1;
-    long remote_path_addr = remote_call(pid, remote_malloc_addr, malloc_args, 1, 1);
+    long remote_path_addr = remote_call(pid, malloc_addr, malloc_args, 1, 1);
 
     if (remote_path_addr == 0) {
         fprintf(stderr, "Удаленный malloc вернул NULL\n");
@@ -227,13 +301,13 @@ int main(int argc, char *argv[]) {
     long dlopen_args[2];
     dlopen_args[0] = remote_path_addr;  // путь к библиотеке
     dlopen_args[1] = RTLD_NOW | RTLD_GLOBAL;  // флаги
-    long handle = remote_call(pid, remote_dlopen_addr, dlopen_args, 2, 1);
+    long handle = remote_call(pid, dlopen_addr, dlopen_args, 2, 1);
 
     if (handle == 0) {
         fprintf(stderr, "dlopen в удаленном процессе вернул NULL\n");
         
         // Получаем сообщение об ошибке от dlerror
-        void *remote_dlerror_addr = (void *)dlsym(RTLD_NEXT, "dlerror");
+        void *remote_dlerror_addr = find_remote_symbol(pid, "libc.so.6", "dlerror");
         if (remote_dlerror_addr != NULL) {
             long error_msg_addr = remote_call(pid, remote_dlerror_addr, NULL, 0, 1);
             if (error_msg_addr != 0) {
@@ -244,10 +318,10 @@ int main(int argc, char *argv[]) {
         }
         
         // Освобождаем выделенную память
-        void *remote_free_addr = (void *)dlsym(RTLD_NEXT, "free");
-        if (remote_free_addr != NULL) {
+        void *free_addr = find_remote_symbol(pid, "libc.so.6", "free");
+        if (free_addr) {
             long free_args[1] = {remote_path_addr};
-            remote_call(pid, remote_free_addr, free_args, 1, 1);
+            remote_call(pid, free_addr, free_args, 1, 1);
         }
         
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
@@ -257,9 +331,11 @@ int main(int argc, char *argv[]) {
     printf("Библиотека успешно загружена, handle: 0x%lx\n", handle);
 
     // Освобождаем выделенную память
-    void *remote_free_addr = (void *)dlsym(RTLD_NEXT, "free");
-    long free_args[1] = {remote_path_addr};
-    remote_call(pid, remote_free_addr, free_args, 1, 1);
+    void *free_addr = find_remote_symbol(pid, "libc.so.6", "free");
+    if (free_addr) {
+        long free_args[1] = {remote_path_addr};
+        remote_call(pid, free_addr, free_args, 1, 1);
+    }
 
     // Отсоединяемся от процесса
     if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
