@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/prctl.h>
+
 
 volatile sig_atomic_t running = 1;
 
@@ -12,6 +14,14 @@ void handle_signal(int sig) {
 
 int main() {
     printf("PID программы: %d\n", getpid());
+
+    // Включаем защиту от PTR_ATTACH
+    prctl(PR_SET_DUMPABLE, 0);
+
+    // В некоторых системах можно использовать это для запрета отладки
+    #ifdef PR_SET_PTRACER
+    prctl(PR_SET_PTRACER, 0);
+    #endif
     
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
