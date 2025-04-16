@@ -2,7 +2,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/prctl.h>
+#include <errno.h>
+#include <string.h>
 
 
 volatile sig_atomic_t running = 1;
