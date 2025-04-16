@@ -7,6 +7,49 @@
 
 volatile sig_atomic_t running = 1;
 
+int check_debugger() {
+    if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) {
+        if (errno == EPERM) {
+            return 1;
+        }
+    } else {
+        ptrace(PTRACE_DETACH, 0, 0, 0);
+    }
+
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "TracerPid:", 10) == 0) {
+                int tracer_pid = atoi(line + 10);
+                if (tracer_pid != 0) {
+                    fclose(f);
+                    return 1;
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+    
+    return 0;
+}
+
+void anti_debug_check() {
+    static time_t last_check = 0;
+    time_t now = time(NULL);
+    
+    if (now - last_check >= 2) {
+        last_check = now;
+        
+        if (check_debugger()) {
+            printf("\n!!! Обнаружена попытка отладки! Завершение работы !!!\n");
+            fflush(stdout);
+            exit(1);
+        }
+    }
+}
+
 void handle_signal(int sig) {
     printf("Получен сигнал: %d\n", sig);
     running = 0;
@@ -15,10 +58,8 @@ void handle_signal(int sig) {
 int main() {
     printf("PID программы: %d\n", getpid());
 
-    // Включаем защиту от PTR_ATTACH
     prctl(PR_SET_DUMPABLE, 0);
 
-    // В некоторых системах можно использовать это для запрета отладки
     #ifdef PR_SET_PTRACER
     prctl(PR_SET_PTRACER, 0);
     #endif
@@ -29,6 +70,7 @@ int main() {
     int counter = 1;
     
     while (running) {
+        anti_debug_check();
         printf("Текущее число: %d из 20\n", counter);
         fflush(stdout);
         
