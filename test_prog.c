@@ -26,6 +26,7 @@ int check_debugger() {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             if (strncmp(line, "TracerPid:", 10) == 0) {
+                printf("TracerPid: %s", line + 10);
                 int tracer_pid = atoi(line + 10);
                 if (tracer_pid != 0) {
                     fclose(f);
